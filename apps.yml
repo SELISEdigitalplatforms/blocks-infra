@@ -1,0 +1,215 @@
+# Application catalog consumed by the deployment compose generator.
+# Fill in the domain, then point the compose templating at this file.
+#
+# Top-level: base domain + Let's Encrypt contact. Subdomains are built as
+#   <subdomain>.<domain>  -> e.g. iam.example.com
+# Workers are NOT exposed via nginx; they only consume RabbitMQ.
+#
+# Each service's image is described structurally:
+#   image:
+#     registry: blocksos          # Docker Hub namespace (public)
+#     repository: blocks-os-api   # blocks-<svc>-<api|worker>
+#     tag: ${OS_TAG}              # commit SHA; -api/-worker of a svc share it.
+#                                 # blank => run.sh resolves the newest pushed
+#                                 # tag at deploy time. No `latest` exists upstream.
+# Full ref = <registry>/<repository>:<tag>, e.g. blocksos/blocks-os-api:<sha>.
+
+domain: example.com
+letsencrypt_email: ops@example.com
+
+# Optional: extra env shared by every service (rare — base infra env comes from .env).
+# shared_env:
+#   SOME_GLOBAL_KEY: value
+
+services:
+  # -------- blocks-os --------
+  - name: os-api
+    image:
+      registry: blocksos
+      repository: blocks-os-api
+      tag: ${OS_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: os
+    port: 8080
+    profile: os
+    # env:
+    #   BlocksSecret__SomeOsSpecificKey: changeme
+
+  - name: os-worker
+    image:
+      registry: blocksos
+      repository: blocks-os-worker
+      tag: ${OS_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: os
+
+  # -------- blocks-iam --------
+  - name: iam-api
+    image:
+      registry: blocksos
+      repository: blocks-iam-api
+      tag: ${IAM_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: iam
+    port: 8080
+    profile: iam
+
+  - name: iam-worker
+    image:
+      registry: blocksos
+      repository: blocks-iam-worker
+      tag: ${IAM_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: iam
+
+  # -------- blocks-data --------
+  - name: data-api
+    image:
+      registry: blocksos
+      repository: blocks-data-api
+      tag: ${DATA_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: data
+    port: 8080
+    profile: data
+
+  - name: data-worker
+    image:
+      registry: blocksos
+      repository: blocks-data-worker
+      tag: ${DATA_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: data
+
+  # -------- blocks-agents (Python / FastAPI) --------
+  - name: agents-api
+    image:
+      registry: blocksos
+      repository: blocks-agents-api
+      tag: ${AGENTS_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: agents
+    port: 8000
+    profile: agents
+
+  - name: agents-worker
+    image:
+      registry: blocksos
+      repository: blocks-agents-worker
+      tag: ${AGENTS_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: agents
+
+  # -------- blocks-logic --------
+  - name: logic-api
+    image:
+      registry: blocksos
+      repository: blocks-logic-api
+      tag: ${LOGIC_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: logic
+    port: 8080
+    profile: logic
+
+  - name: logic-worker
+    image:
+      registry: blocksos
+      repository: blocks-logic-worker
+      tag: ${LOGIC_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: logic
+
+  # -------- blocks-localization --------
+  - name: localization-api
+    image:
+      registry: blocksos
+      repository: blocks-localization-api
+      tag: ${LOCALIZATION_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: localization
+    port: 8080
+    profile: localization
+
+  - name: localization-worker
+    image:
+      registry: blocksos
+      repository: blocks-localization-worker
+      tag: ${LOCALIZATION_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: localization
+
+  # -------- blocks-monitor --------
+  - name: monitor-api
+    image:
+      registry: blocksos
+      repository: blocks-monitor-api
+      tag: ${MONITOR_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: monitor
+    port: 8080
+    profile: monitor
+
+  - name: monitor-worker
+    image:
+      registry: blocksos
+      repository: blocks-monitor-worker
+      tag: ${MONITOR_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: monitor
+
+  # -------- blocks-release --------
+  - name: release-api
+    image:
+      registry: blocksos
+      repository: blocks-release-api
+      tag: ${RELEASE_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: release
+    port: 8080
+    profile: release
+
+  - name: release-worker
+    image:
+      registry: blocksos
+      repository: blocks-release-worker
+      tag: ${RELEASE_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: release
+
+  # -------- blocks-studio --------
+  - name: studio-api
+    image:
+      registry: blocksos
+      repository: blocks-studio-api
+      tag: ${STUDIO_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: studio
+    port: 8080
+    profile: studio
+
+  - name: studio-worker
+    image:
+      registry: blocksos
+      repository: blocks-studio-worker
+      tag: ${STUDIO_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: studio
+
+  # -------- blocks-utilities --------
+  - name: utilities-api
+    image:
+      registry: blocksos
+      repository: blocks-utilities-api
+      tag: ${UTILITIES_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: web
+    subdomain: utilities
+    port: 8080
+    profile: utilities
+
+  - name: utilities-worker
+    image:
+      registry: blocksos
+      repository: blocks-utilities-worker
+      tag: ${UTILITIES_TAG}        # blank -> newest pushed tag, resolved at deploy
+    kind: worker
+    profile: utilities

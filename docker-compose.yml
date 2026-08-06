@@ -1,0 +1,426 @@
+# ============================================================================
+# Blocks platform Compose stack.
+#
+# Profiles:
+#   infra  — MongoDB, Redis, RabbitMQ (+ one-shot Mongo seed)
+#   edge   — nginx-proxy + acme-companion (reverse proxy with Let's Encrypt)
+#   apps   — every application container (10 web APIs + 10 background workers)
+#   <svc>  — per-service profile: os, iam, data, agents, logic, localization,
+#            monitor, release, studio, utilities. Each app belongs to BOTH
+#            `apps` and its <svc> profile, so you can target a single service.
+#
+# Common commands:
+#   docker compose --profile infra up -d
+#       Local dev — Mongo / Redis / RabbitMQ only.
+#   docker compose --profile infra --profile apps --profile edge up -d
+#       Full deployment — infra + every app + reverse proxy with TLS.
+#   docker compose --profile iam up -d
+#       Just iam-api + iam-worker (infra must already be running).
+#   docker compose --profile apps pull
+#       Pre-pull every Docker Hub image referenced by an app service.
+#
+# Notes:
+#   * Inside the Compose network, apps reach infra by service name and the
+#     container's INTERNAL port: mongodb:27017, redis:6379, rabbitmq:5672.
+#     The host-port mappings in the infra block only matter for processes
+#     running on the host (e.g. `dotnet run` via run.sh).
+#   * Workers have no VIRTUAL_HOST/LETSENCRYPT_HOST — they only consume
+#     RabbitMQ and are not reachable from outside the Compose network.
+# ============================================================================
+
+x-app-env: &app-env
+  # Connection strings come from run.sh as APP_* (host-IP based, so the value
+  # persisted into the DB stays reachable by other apps/machines). The :- default
+  # is the in-network service name, so raw `docker compose up` still works.
+  BlocksSecret__DatabaseConnectionString: "${APP_DB_CONNECTION:-mongodb://${MONGO_USER}:${MONGO_PASS}@mongodb:27017/?authSource=admin}"
+  BlocksSecret__LogConnectionString: "${APP_DB_CONNECTION:-mongodb://${MONGO_USER}:${MONGO_PASS}@mongodb:27017/?authSource=admin}"
+  BlocksSecret__MetricConnectionString: "${APP_DB_CONNECTION:-mongodb://${MONGO_USER}:${MONGO_PASS}@mongodb:27017/?authSource=admin}"
+  BlocksSecret__TraceConnectionString: "${APP_DB_CONNECTION:-mongodb://${MONGO_USER}:${MONGO_PASS}@mongodb:27017/?authSource=admin}"
+  BlocksSecret__CacheConnectionString: "${APP_CACHE_CONNECTION:-redis:6379,abortConnect=false}"
+  BlocksSecret__MessageConnectionString: "${APP_MESSAGE_CONNECTION:-amqp://${RABBITMQ_USER}:${RABBITMQ_PASS}@rabbitmq:5672}"
+  BlocksSecret__LmtMessageConnectionString: "${APP_LMT_CONNECTION:-amqp://<username>:<password>@rabbitmq:5672/}"
+  BlocksSecret__RootDatabaseName: "${BlocksSecret__RootDatabaseName}"
+  BlocksSecret__LogDatabaseName: "${BlocksSecret__LogDatabaseName}"
+  BlocksSecret__MetricDatabaseName: "${BlocksSecret__MetricDatabaseName}"
+  BlocksSecret__TraceDatabaseName: "${BlocksSecret__TraceDatabaseName}"
+  BlocksSecret__EnableHsts: "${BlocksSecret__EnableHsts}"
+  BLOCKS_VAULT_TYPE: "${BLOCKS_VAULT_TYPE}"
+
+x-app-defaults: &app-defaults
+  restart: unless-stopped
+
+# Apps must not start until Mongo is healthy AND the seed (mongorestore +
+# configure.js client-id update + 20s settle) has finished — otherwise they boot
+# against stale/half-updated client configuration.
+x-app-deps: &app-deps
+  mongodb:
+    condition: service_healthy
+  mongodb-seed:
+    condition: service_completed_successfully
+
+services:
+  # ------------------------------------------------------------------
+  # INFRA
+  # ------------------------------------------------------------------
+  rabbitmq:
+    profiles: [infra]
+    image: rabbitmq:3-management
+    container_name: rabbitmq
+    ports:
+      - "${RABBITMQ_HOST_PORT}:5672"
+      - "${RABBITMQ_MGMT_PORT}:15672"
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASS}
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    profiles: [infra]
+    image: redis:8-alpine
+    container_name: redis
+    ports:
+      - "${REDIS_HOST_PORT}:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mongodb:
+    profiles: [infra]
+    image: mongo:8
+    container_name: mongodb
+    ports:
+      - "${MONGO_HOST_PORT}:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: ${MONGO_USER}
+      MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASS}
+    volumes:
+      - mongo_data:/data/db
+    healthcheck:
+      test:
+        ["CMD", "mongosh", "--quiet", "mongodb://${MONGO_USER}:${MONGO_PASS}@localhost:27017/admin", "--eval", "db.runCommand({ ping: 1 }).ok"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+
+  mongodb-seed:
+    profiles: [infra]
+    image: mongo:8
+    container_name: mongodb-seed
+    depends_on:
+      mongodb:
+        condition: service_healthy
+    restart: "no"
+    environment:
+      MONGO_USER: ${MONGO_USER}
+      MONGO_PASS: ${MONGO_PASS}
+    volumes:
+      - "./BlocksRootDb:/dump/BlocksRootDb:ro"
+      - "./BlocksConfiguration:/dump/BlocksConfiguration:ro"
+      - "./configure.js:/configure.js:ro"
+    entrypoint: ["/bin/bash"]
+    command:
+      - "-c"
+      - |
+        set -e
+        echo 'Starting MongoDB restore...'
+        mongorestore --drop --db=BlocksRootDb --uri="mongodb://${MONGO_USER}:${MONGO_PASS}@mongodb:27017/?authSource=admin" /dump/BlocksRootDb
+        mongorestore --drop --db=BlocksConfiguration --uri="mongodb://${MONGO_USER}:${MONGO_PASS}@mongodb:27017/?authSource=admin" /dump/BlocksConfiguration
+        echo 'Restore completed. Applying client configuration...'
+        mongosh "mongodb://${MONGO_USER}:${MONGO_PASS}@mongodb:27017/BlocksRootDb?authSource=admin" /configure.js
+        echo 'Configuration applied. Settling for 20s before apps start...'
+        sleep 20
+        echo 'Done.'
+
+  # ------------------------------------------------------------------
+  # EDGE — nginx reverse proxy + automatic Let's Encrypt via acme-companion
+  # ------------------------------------------------------------------
+  nginx-proxy:
+    profiles: [edge]
+    image: nginxproxy/nginx-proxy:latest
+    container_name: nginx-proxy
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/tmp/docker.sock:ro
+      - nginx_certs:/etc/nginx/certs
+      - nginx_vhost:/etc/nginx/vhost.d
+      - nginx_html:/usr/share/nginx/html
+    restart: unless-stopped
+
+  acme-companion:
+    profiles: [edge]
+    image: nginxproxy/acme-companion:latest
+    container_name: acme-companion
+    depends_on:
+      - nginx-proxy
+    environment:
+      DEFAULT_EMAIL: ${LETSENCRYPT_EMAIL}
+      NGINX_PROXY_CONTAINER: nginx-proxy
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - nginx_certs:/etc/nginx/certs
+      - nginx_vhost:/etc/nginx/vhost.d
+      - nginx_html:/usr/share/nginx/html
+      - acme_state:/etc/acme.sh
+    restart: unless-stopped
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-os
+  # ------------------------------------------------------------------
+  os-api:
+    <<: *app-defaults
+    profiles: [apps, os]
+    image: blocksos/blocks-os-api:${OS_TAG:-latest}
+    container_name: os-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "os.${DOMAIN}"
+      LETSENCRYPT_HOST: "os.${DOMAIN}"
+      VIRTUAL_PORT: 5000
+
+  os-worker:
+    <<: *app-defaults
+    profiles: [apps, os]
+    image: blocksos/blocks-os-worker:${OS_TAG:-latest}
+    container_name: os-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-iam
+  # ------------------------------------------------------------------
+  iam-api:
+    <<: *app-defaults
+    profiles: [apps, iam]
+    image: blocksos/blocks-iam-api:${IAM_TAG:-latest}
+    container_name: iam-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "iam.${DOMAIN}"
+      LETSENCRYPT_HOST: "iam.${DOMAIN}"
+      VIRTUAL_PORT: 5000
+
+  iam-worker:
+    <<: *app-defaults
+    profiles: [apps, iam]
+    image: blocksos/blocks-iam-worker:${IAM_TAG:-latest}
+    container_name: iam-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-data
+  # ------------------------------------------------------------------
+  data-api:
+    <<: *app-defaults
+    profiles: [apps, data]
+    image: blocksos/blocks-data-api:${DATA_TAG:-latest}
+    container_name: data-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "data.${DOMAIN}"
+      LETSENCRYPT_HOST: "data.${DOMAIN}"
+      VIRTUAL_PORT: 5000
+
+  data-worker:
+    <<: *app-defaults
+    profiles: [apps, data]
+    image: blocksos/blocks-data-worker:${DATA_TAG:-latest}
+    container_name: data-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-agents (Python / FastAPI — internal port 8000)
+  # ------------------------------------------------------------------
+  agents-api:
+    <<: *app-defaults
+    profiles: [apps, agents]
+    image: blocksos/blocks-agents-api:${AGENTS_TAG:-latest}
+    container_name: agents-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "agents.${DOMAIN}"
+      LETSENCRYPT_HOST: "agents.${DOMAIN}"
+      VIRTUAL_PORT: 8000
+
+  agents-worker:
+    <<: *app-defaults
+    profiles: [apps, agents]
+    image: blocksos/blocks-agents-worker:${AGENTS_TAG:-latest}
+    container_name: agents-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-logic
+  # ------------------------------------------------------------------
+  logic-api:
+    <<: *app-defaults
+    profiles: [apps, logic]
+    image: blocksos/blocks-logic-api:${LOGIC_TAG:-latest}
+    container_name: logic-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "logic.${DOMAIN}"
+      LETSENCRYPT_HOST: "logic.${DOMAIN}"
+      VIRTUAL_PORT: 5000
+
+  logic-worker:
+    <<: *app-defaults
+    profiles: [apps, logic]
+    image: blocksos/blocks-logic-worker:${LOGIC_TAG:-latest}
+    container_name: logic-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-localization
+  # ------------------------------------------------------------------
+  localization-api:
+    <<: *app-defaults
+    profiles: [apps, localization]
+    image: blocksos/blocks-localization-api:${LOCALIZATION_TAG:-latest}
+    container_name: localization-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "localization.${DOMAIN}"
+      LETSENCRYPT_HOST: "localization.${DOMAIN}"
+      VIRTUAL_PORT: 5000
+
+  localization-worker:
+    <<: *app-defaults
+    profiles: [apps, localization]
+    image: blocksos/blocks-localization-worker:${LOCALIZATION_TAG:-latest}
+    container_name: localization-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-monitor
+  # ------------------------------------------------------------------
+  monitor-api:
+    <<: *app-defaults
+    profiles: [apps, monitor]
+    image: blocksos/blocks-monitor-api:${MONITOR_TAG:-latest}
+    container_name: monitor-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "monitor.${DOMAIN}"
+      LETSENCRYPT_HOST: "monitor.${DOMAIN}"
+      VIRTUAL_PORT: 5000
+
+  monitor-worker:
+    <<: *app-defaults
+    profiles: [apps, monitor]
+    image: blocksos/blocks-monitor-worker:${MONITOR_TAG:-latest}
+    container_name: monitor-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-release
+  # ------------------------------------------------------------------
+  release-api:
+    <<: *app-defaults
+    profiles: [apps, release]
+    image: blocksos/blocks-release-api:${RELEASE_TAG:-latest}
+    container_name: release-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "release.${DOMAIN}"
+      LETSENCRYPT_HOST: "release.${DOMAIN}"
+      VIRTUAL_PORT: 5000
+
+  release-worker:
+    <<: *app-defaults
+    profiles: [apps, release]
+    image: blocksos/blocks-release-worker:${RELEASE_TAG:-latest}
+    container_name: release-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-studio
+  # ------------------------------------------------------------------
+  studio-api:
+    <<: *app-defaults
+    profiles: [apps, studio]
+    image: blocksos/blocks-studio-api:${STUDIO_TAG:-latest}
+    container_name: studio-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "studio.${DOMAIN}"
+      LETSENCRYPT_HOST: "studio.${DOMAIN}"
+      VIRTUAL_PORT: 5000
+
+  studio-worker:
+    <<: *app-defaults
+    profiles: [apps, studio]
+    image: blocksos/blocks-studio-worker:${STUDIO_TAG:-latest}
+    container_name: studio-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+  # ------------------------------------------------------------------
+  # APPS — blocks-utilities
+  # ------------------------------------------------------------------
+  utilities-api:
+    <<: *app-defaults
+    profiles: [apps, utilities]
+    image: blocksos/blocks-utilities-api:${UTILITIES_TAG:-latest}
+    container_name: utilities-api
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+      VIRTUAL_HOST: "utilities.${DOMAIN}"
+      LETSENCRYPT_HOST: "utilities.${DOMAIN}"
+      VIRTUAL_PORT: 5000
+
+  utilities-worker:
+    <<: *app-defaults
+    profiles: [apps, utilities]
+    image: blocksos/blocks-utilities-worker:${UTILITIES_TAG:-latest}
+    container_name: utilities-worker
+    depends_on: *app-deps
+    environment:
+      <<: *app-env
+
+volumes:
+  rabbitmq_data:
+  redis_data:
+  mongo_data:
+  nginx_certs:
+  nginx_vhost:
+  nginx_html:
+  acme_state:
