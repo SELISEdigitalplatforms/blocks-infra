@@ -3,3 +3,13 @@
 configure.js
 .claude
 -
+
+# --- local tooling scripts (Windows + bash) - do not commit ---
+scripts/scan.sh
+scripts/scan.ps1
+scripts/deploy.sh
+scripts/deploy.ps1
+scripts/th_transform.py
+scripts/secrets.local.ps1
+results/
+deploy.log
