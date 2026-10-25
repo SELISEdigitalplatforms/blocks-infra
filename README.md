@@ -101,16 +101,6 @@ docker compose --profile apps pull
 docker compose --profile apps up -d      # recreates containers using new images
 ```
 
-## Seed additional data with init-mongo.js
-
-After the containers are running, seed the `ApiEndpointConfigs` collection into tenant databases:
-
-```bash
-mongosh "mongodb://${MONGO_USER}:${MONGO_PASS}@localhost:27018/?authSource=admin" --file init-mongo.js
-```
-
-To add more tenant databases, append their names to the `databases` array in [init-mongo.js](init-mongo.js).
-
 ## Configure your local application
 
 `.env` holds the single source of truth for credentials and ports. It has two kinds of entries:
